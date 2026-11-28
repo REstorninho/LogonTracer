@@ -4449,6 +4449,12 @@ def parse_evtx(evtx_list, case):
     batch_events = []
     batch_ml_events = []
     batch_count_events = []
+    # Batch DataFrames are collected and concatenated once after the loop.
+    # Concatenating into the growing DataFrames on every batch copied all previous rows each time
+    # (quadratic), so multi-GB logs got slower and slower as parsing advanced.
+    event_parts = [event_set]
+    ml_parts = [ml_frame]
+    count_parts = [count_set]
 
     for evtx_file in evtx_list:
         logger.info("[+] Parse the EVTX file {0}.".format(evtx_file))
@@ -4650,10 +4656,9 @@ def parse_evtx(evtx_list, case):
                             batch_ml_df = pd.DataFrame(batch_ml_events, columns=ml_frame.columns)
                             batch_count_df = pd.DataFrame(batch_count_events, columns=count_set.columns)
                             
-                            # Concatenate batch DataFrames to main DataFrames
-                            event_set = pd.concat([event_set, batch_df], ignore_index=True)
-                            ml_frame = pd.concat([ml_frame, batch_ml_df], ignore_index=True)
-                            count_set = pd.concat([count_set, batch_count_df], ignore_index=True)
+                            event_parts.append(batch_df)
+                            ml_parts.append(batch_ml_df)
+                            count_parts.append(batch_count_df)
                             
                             # Clear batch lists
                             batch_events.clear()
@@ -4743,10 +4748,14 @@ def parse_evtx(evtx_list, case):
         batch_ml_df = pd.DataFrame(batch_ml_events, columns=ml_frame.columns)
         batch_count_df = pd.DataFrame(batch_count_events, columns=count_set.columns)
         
-        event_set = pd.concat([event_set, batch_df], ignore_index=True)
-        ml_frame = pd.concat([ml_frame, batch_ml_df], ignore_index=True)
-        count_set = pd.concat([count_set, batch_count_df], ignore_index=True)
-        logger.info("\n[+] Load finished.")
+        event_parts.append(batch_df)
+        ml_parts.append(batch_ml_df)
+        count_parts.append(batch_count_df)
+    event_set = pd.concat(event_parts, ignore_index=True)
+    ml_frame = pd.concat(ml_parts, ignore_index=True)
+    count_set = pd.concat(count_parts, ignore_index=True)
+    del event_parts, ml_parts, count_parts
+    logger.info("\n[+] Load finished.")
     logger.info("[+] Total Event log is {0}.".format(count))
 
     if not username_set or not len(event_set):
