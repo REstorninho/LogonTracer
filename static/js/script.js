@@ -1707,6 +1707,9 @@ function uploadResponseError(xhr) {
   if (xhr.status == 413) {
     return "File too large (LOGONTRACER_MAX_UPLOAD_MB).";
   }
+  if (xhr.status == 401) {
+    return "Login expired (server restarted?). Reload the page and log in again.";
+  }
   if (xhr.status == 400) {
     return "Request rejected (CSRF token / session expired). Reload the page and log in again.";
   }

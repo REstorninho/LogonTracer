@@ -1436,6 +1436,17 @@ def login_required(role="ANY"):
             ensure_neo4j_imported()
             if not current_user.is_authenticated:
                return login_manager.unauthorized()
+            # Neo4j credentials live only in server memory: after a restart the browser session
+            # is still valid but the credentials are gone. End the session and ask for a new login
+            # instead of failing later inside the route.
+            if get_neo4j_creds()[0] is None:
+                logger.info("[+] Neo4j credentials not in cache (server restart or expiry); login required.")
+                logout_user()
+                session.clear()
+                if request.method != "GET" or request.headers.get("X-Requested-With") == "XMLHttpRequest" \
+                        or request.headers.get("X-CSRFToken"):
+                    return "LOGIN_REQUIRED", 401
+                return login_manager.unauthorized()
             urole = current_user.get_urole()
             if ((urole != role) and (role != "ANY")):
                 return login_manager.unauthorized()
@@ -2334,7 +2345,19 @@ def do_upload():
         os.makedirs(UPLOAD_DIR)
         logger.info("[+] make upload folder {0}.".format(UPLOAD_DIR))
 
+    def _reject(reason):
+        logger.warning("[!] Upload rejected: %s", reason)
+        for saved in filelist:
+            try:
+                os.remove(saved)
+            except OSError:
+                logger.warning("[!] Could not remove rejected upload %s.", os.path.basename(saved))
+        return "FAIL"
+
     try:
+        _up_user, _up_pass = get_neo4j_creds()
+        if _up_user is None:
+            return _reject("Neo4j credentials expired, log in again.")
         timezone = request.form["timezone"]
         logtype = request.form["logtype"]
         addlog = request.form["addlog"]
@@ -2363,18 +2386,15 @@ def do_upload():
                 logger.info(f"[+] Uploaded file saved as: {unique_filename}")
                 
         if not filelist:
-            logger.warning("[!] Upload rejected: no file received (logtype=%s).", logtype)
-            return "FAIL"
+            return _reject("no file received.")
         if "EVTX" in logtype:
             logoption = "-e"
         elif "XML" in logtype:
             logoption = "-x"
         else:
-            logger.warning("[!] Upload rejected: unsupported log type.")
-            return "FAIL"
+            return _reject("unsupported log type.")
         if not is_valid_timezone(timezone):
-            logger.warning("[!] Upload rejected: invalid time zone value.")
-            return "FAIL"
+            return _reject("invalid time zone value.")
         if addlog == "true":
             add_option = "--add"
         else:
@@ -2384,17 +2404,12 @@ def do_upload():
         else:
             sigma_option = []
         if not re.search(r"\A[0-9a-zA-Z]{2,20}\Z", casename):
-            logger.warning("[!] Upload rejected: invalid case name.")
-            return "FAIL"
+            return _reject("invalid case name.")
 
         log_file = os.path.join(FPATH, "static", "logontracer.log")
         if os.path.exists(log_file):
             os.remove(log_file)
 
-        _up_user, _up_pass = get_neo4j_creds()
-        if _up_user is None:
-            logger.warning("[!] Upload rejected: Neo4j credentials expired, log in again.")
-            return "FAIL"
         # The Neo4j password goes through the environment, not argv:
         # /proc/<pid>/cmdline is readable by every local user, environ only by the owner.
         parse_command = [sys.executable, os.path.join(FPATH, "logontracer.py"),
@@ -2413,7 +2428,7 @@ def do_upload():
 
     except Exception:
         logger.exception("[!] Upload processing failed.")
-        return "FAIL"
+        return _reject("internal error (see traceback above).")
 
 
 # Load from Elasticsearch
@@ -2466,8 +2481,7 @@ def es_load():
             es_option = []
 
         if not re.search(r"\A[0-9a-zA-Z]{2,20}\Z", casename):
-            logger.warning("[!] Upload rejected: invalid case name.")
-            return "FAIL"
+            return _reject("invalid case name.")
 
         log_file = os.path.join(FPATH, "static", "logontracer.log")
         if os.path.exists(log_file):
