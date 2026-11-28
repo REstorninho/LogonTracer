@@ -3158,6 +3158,38 @@ def to_lxml(record_xml):
     return etree.fromstring(fin_xml, parser)
 
 
+EVTX_FILE_HEADER_SIZE = 0x1000
+EVTX_CHUNK_SIZE = 0x10000
+EVTX_CHUNK_SIGNATURE = b"ElfChnk\x00"
+# Smallest possible event record is 24 bytes, so a 64 KiB chunk cannot hold more than this.
+EVTX_MAX_RECORDS_PER_CHUNK = EVTX_CHUNK_SIZE // 24
+
+
+def evtx_record_count(filename):
+    """
+    Number of event records in an EVTX file, read from the chunk headers
+    (first/last event record number at offsets 8 and 16). Constant memory, reads ~24 bytes per 64 KiB.
+    Chunks with an invalid or inconsistent header (e.g. the chunk being written when the log was copied)
+    are skipped, so the result is used only for progress display.
+    """
+    import struct
+    total = 0
+    with open(filename, "rb") as fh:
+        offset = EVTX_FILE_HEADER_SIZE
+        while True:
+            fh.seek(offset)
+            header = fh.read(24)
+            if len(header) < 24:
+                break
+            if header[:8] == EVTX_CHUNK_SIGNATURE:
+                first, last = struct.unpack_from("<QQ", header, 8)
+                count = last - first + 1
+                if 0 < count <= EVTX_MAX_RECORDS_PER_CHUNK:
+                    total += count
+            offset += EVTX_CHUNK_SIZE
+    return total
+
+
 def xml_records(filename):
     from evtx import PyEvtxParser
     from lxml import etree
@@ -4394,10 +4426,9 @@ def parse_evtx(evtx_list, case):
                     logger.error("[!] This file is not EVTX format {0}.".format(evtx_file))
                     sys.exit(1)
 
-            with open(evtx_file, "rb") as evtx:
-                parser = PyEvtxParser(evtx)
-                records = list(parser.records())
-                record_sum += len(records)
+            # Count from chunk headers: list(parser.records()) rendered every record into memory
+            # (tens of GB of RAM for a multi-GB EVTX) only to show a progress percentage.
+            record_sum += evtx_record_count(evtx_file)
 
         if args.xmls:
             with open(evtx_file, "r", encoding="utf8", errors="ignore") as fb:
@@ -4418,6 +4449,12 @@ def parse_evtx(evtx_list, case):
     batch_events = []
     batch_ml_events = []
     batch_count_events = []
+    # Batch DataFrames are collected and concatenated once after the loop.
+    # Concatenating into the growing DataFrames on every batch copied all previous rows each time
+    # (quadratic), so multi-GB logs got slower and slower as parsing advanced.
+    event_parts = [event_set]
+    ml_parts = [ml_frame]
+    count_parts = [count_set]
 
     for evtx_file in evtx_list:
         logger.info("[+] Parse the EVTX file {0}.".format(evtx_file))
@@ -4619,10 +4656,9 @@ def parse_evtx(evtx_list, case):
                             batch_ml_df = pd.DataFrame(batch_ml_events, columns=ml_frame.columns)
                             batch_count_df = pd.DataFrame(batch_count_events, columns=count_set.columns)
                             
-                            # Concatenate batch DataFrames to main DataFrames
-                            event_set = pd.concat([event_set, batch_df], ignore_index=True)
-                            ml_frame = pd.concat([ml_frame, batch_ml_df], ignore_index=True)
-                            count_set = pd.concat([count_set, batch_count_df], ignore_index=True)
+                            event_parts.append(batch_df)
+                            ml_parts.append(batch_ml_df)
+                            count_parts.append(batch_count_df)
                             
                             # Clear batch lists
                             batch_events.clear()
@@ -4712,10 +4748,14 @@ def parse_evtx(evtx_list, case):
         batch_ml_df = pd.DataFrame(batch_ml_events, columns=ml_frame.columns)
         batch_count_df = pd.DataFrame(batch_count_events, columns=count_set.columns)
         
-        event_set = pd.concat([event_set, batch_df], ignore_index=True)
-        ml_frame = pd.concat([ml_frame, batch_ml_df], ignore_index=True)
-        count_set = pd.concat([count_set, batch_count_df], ignore_index=True)
-        logger.info("\n[+] Load finished.")
+        event_parts.append(batch_df)
+        ml_parts.append(batch_ml_df)
+        count_parts.append(batch_count_df)
+    event_set = pd.concat(event_parts, ignore_index=True)
+    ml_frame = pd.concat(ml_parts, ignore_index=True)
+    count_set = pd.concat(count_parts, ignore_index=True)
+    del event_parts, ml_parts, count_parts
+    logger.info("\n[+] Load finished.")
     logger.info("[+] Total Event log is {0}.".format(count))
 
     if not username_set or not len(event_set):
